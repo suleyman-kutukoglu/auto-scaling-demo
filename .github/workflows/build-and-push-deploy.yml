@@ -1,4 +1,4 @@
-name: build-push-and-deploy-stop-the-world
+name: build-and-deploy-asg
 
 on:
   push:
@@ -8,27 +8,11 @@ permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: prod-deploy
-  cancel-in-progress: true
-
 jobs:
-  build_push_deploy:
+  build_deploy:
     runs-on: ubuntu-latest
     env:
-      ASG_ENDPOINT: ${{ secrets.ASG_ENDPOINT }}
-      ASG_NAME: ${{ secrets.ASG_NAME }}
-      AMI_ID: ${{ secrets.AMI_ID }}
-      KEY_NAME: ${{ secrets.KEY_NAME }}
-      SECURITY_GROUP_ID: ${{ secrets.SECURITY_GROUP_ID }}
-      INSTANCE_TYPE: ${{ secrets.INSTANCE_TYPE }}
-      IMAGE_REPO: ghcr.io/${{ github.repository }}
-      IMAGE_SHA: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-      IMAGE_LATEST: ghcr.io/${{ github.repository }}:latest
-
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      IMAGE_REPO: ghcr.io/suleyman-kutukoglu/auto-scaling-demo
 
     steps:
       - uses: actions/checkout@v4
@@ -43,36 +27,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE_SHA }}
-            ${{ env.IMAGE_LATEST }}
+            ghcr.io/suleyman-kutukoglu/auto-scaling-demo:sha-${{ github.sha }}
+            ghcr.io/suleyman-kutukoglu/auto-scaling-demo:latest
 
       - name: Install AWS CLI (if missing)
+        shell: bash
         run: |
           if ! command -v aws >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y awscli
+            curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install
           fi
           aws --version
 
-      - name: Stop-the-world deploy (create LC -> ASG update -> scale 0 -> scale 1) and wait healthy
+      - name: Deploy to ASG (LC + stop-the-world rollout)
         shell: bash
+        env:
+          ASG_ENDPOINT: ${{ secrets.ASG_ENDPOINT }}   # example: https://cloud-tr-03.rng.tech/api/v2/aws
+          ASG_NAME:     ${{ secrets.ASG_NAME }}       # Auto-Scaling
+          AMI_ID:       ${{ secrets.AMI_ID }}
+          KEY_NAME:     ${{ secrets.KEY_NAME }}
+          SECURITY_GROUP_ID: ${{ secrets.SECURITY_GROUP_ID }}
+          INSTANCE_TYPE: ${{ secrets.INSTANCE_TYPE }}
+
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_DEFAULT_REGION }}
         run: |
           set -euo pipefail
+
+          # IMPORTANT:
+          # Your AWS-like endpoint must include /api/v2/aws (NOT /autoscaling at the end).
+          # We call 'autoscaling' service path via the aws cli itself.
+          awsa() { aws --endpoint-url "$ASG_ENDPOINT" "$@"; }
+
+          IMAGE_SHA="${IMAGE_REPO}:sha-${GITHUB_SHA}"
 
           echo "Endpoint: $ASG_ENDPOINT"
           echo "ASG: $ASG_NAME"
           echo "Image: $IMAGE_SHA"
 
-          # Helper: AWS CLI wrapper with endpoint
-          awsa() { aws --endpoint-url "$ASG_ENDPOINT" "$@"; }
-
-          # 1) Create cloud-init user-data (plain #cloud-config) referencing the immutable image tag
+          # 1) Generate RAW cloud-init (NO base64!)
           cat > cloudinit.yml <<EOF
           #cloud-config
           write_files:
@@ -87,7 +88,7 @@ jobs:
 
                 IMAGE="$IMAGE_SHA"
 
-                # basic retry/backoff for flaky pulls
+                # retry/backoff for flaky network pulls
                 for i in 1 2 3 4 5; do
                   docker pull "\$IMAGE" && break
                   echo "docker pull failed (attempt \$i) - sleeping..." >&2
@@ -100,36 +101,28 @@ jobs:
             - [ bash, -lc, /usr/local/bin/run-app.sh ]
           EOF
 
-          # 2) base64 user-data (platform expects base64 on UserData field)
-          UD_B64="$(base64 -w0 cloudinit.yml)"
-
-          # 3) Create a unique Launch Configuration for this commit
+          # 2) Create LC for this commit
           LC="auto-scale-demo-${GITHUB_SHA:0:8}"
-          cat > lc.json <<EOF
-          {
-            "LaunchConfigurationName": "$LC",
-            "ImageId": "$AMI_ID",
-            "KeyName": "$KEY_NAME",
-            "SecurityGroups": ["$SECURITY_GROUP_ID"],
-            "InstanceType": "$INSTANCE_TYPE",
-            "UserData": "$UD_B64"
-          }
-          EOF
-
           echo "Creating Launch Configuration: $LC"
-          awsa autoscaling create-launch-configuration --cli-input-json file://lc.json
 
-          # 4) Stop-the-world: set desired/min to 0 (terminate all)
+          awsa autoscaling create-launch-configuration \
+            --launch-configuration-name "$LC" \
+            --image-id "$AMI_ID" \
+            --key-name "$KEY_NAME" \
+            --security-groups "$SECURITY_GROUP_ID" \
+            --instance-type "$INSTANCE_TYPE" \
+            --user-data file://cloudinit.yml
+
+          # 3) Stop-the-world rollout: scale down to 0 (terminate all), but also point ASG to new LC
           echo "Scaling down to 0 (stop-the-world)..."
           awsa autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "$ASG_NAME" \
+            --launch-configuration-name "$LC" \
             --min-size 0 \
-            --desired-capacity 0 \
-            --launch-configuration-name "$LC" || true
+            --desired-capacity 0
 
-          # Wait until Instances is empty
           echo "Waiting until ASG has 0 instances..."
-          for _ in {1..60}; do
+          for _ in {1..90}; do
             COUNT="$(awsa autoscaling describe-auto-scaling-groups \
               --auto-scaling-group-names "$ASG_NAME" \
               --query 'AutoScalingGroups[0].Instances | length(@)' \
@@ -139,7 +132,14 @@ jobs:
             sleep 5
           done
 
-          # 5) Scale up to 1 using new LC
+          # Hard fail if couldn't drain to 0
+          COUNT="$(awsa autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].Instances | length(@)' \
+            --output text)"
+          [ "$COUNT" = "0" ] || { echo "❌ Still not 0 instances"; exit 1; }
+
+          # 4) Scale up to 1
           echo "Scaling up to 1 with new LC..."
           awsa autoscaling update-auto-scaling-group \
             --auto-scaling-group-name "$ASG_NAME" \
@@ -147,15 +147,14 @@ jobs:
             --min-size 1 \
             --desired-capacity 1
 
-          # 6) Wait until 1 instance is InService+Healthy AND uses the new LC
+          # 5) Wait for new instance using this LC
           echo "Waiting for 1 Healthy/InService instance with LC=$LC ..."
-          for _ in {1..90}; do
+          for _ in {1..120}; do
             OUT="$(awsa autoscaling describe-auto-scaling-groups \
               --auto-scaling-group-names "$ASG_NAME" \
               --query "AutoScalingGroups[0].Instances[?LaunchConfigurationName=='$LC'].[InstanceId,LifecycleState,HealthStatus] | [0]" \
               --output text || true)"
 
-            # OUT format: i-xxxx  InService  Healthy  (or "None")
             echo "Candidate: $OUT"
             if echo "$OUT" | grep -qE '^i-'; then
               STATE="$(echo "$OUT" | awk '{print $2}')"
